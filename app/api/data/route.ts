@@ -2,6 +2,10 @@ import { mapStudent, mapTask, mapTaskLog } from "@/src/lib/dbMappers";
 import { supabaseAdmin } from "@/src/lib/supabaseAdmin";
 
 export async function GET() {
+  const headers = {
+    "Cache-Control": "no-store, max-age=0",
+  };
+
   const [studentsResult, tasksResult, logsResult] = await Promise.all([
     supabaseAdmin.from("students").select("*").order("display_order", { ascending: true }),
     supabaseAdmin
@@ -19,12 +23,15 @@ export async function GET() {
   const firstError = studentsResult.error ?? tasksResult.error ?? logsResult.error;
 
   if (firstError) {
-    return Response.json({ error: firstError.message }, { status: 500 });
+    return Response.json(
+      { error: firstError.message },
+      { status: 500, headers },
+    );
   }
 
   return Response.json({
     students: (studentsResult.data ?? []).map(mapStudent),
     tasks: (tasksResult.data ?? []).map(mapTask),
     task_logs: (logsResult.data ?? []).map(mapTaskLog),
-  });
+  }, { headers });
 }

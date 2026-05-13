@@ -1,6 +1,14 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Component,
+  FormEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 type Degree = "博士" | "硕士";
 type DegreeFilter = "全部" | Degree;
@@ -96,6 +104,17 @@ type TaskMutationResponse = {
   log?: ChangeRecord;
   logs?: ChangeRecord[];
   error?: string;
+};
+
+type SafeSectionProps = {
+  children: ReactNode;
+  fallback: string;
+  name: string;
+};
+
+type SafeSectionState = {
+  hasError: boolean;
+  message: string;
 };
 
 const initialStudents: Student[] = [
@@ -322,12 +341,50 @@ function formatChangeValue(field: keyof TaskDraft, value: TaskDraft[keyof TaskDr
   return field === "progress" ? `${value}%` : String(value);
 }
 
+class SafeSection extends Component<SafeSectionProps, SafeSectionState> {
+  state: SafeSectionState = {
+    hasError: false,
+    message: "",
+  };
+
+  static getDerivedStateFromError(error: unknown): SafeSectionState {
+    return {
+      hasError: true,
+      message: error instanceof Error ? error.message : "模块渲染失败。",
+    };
+  }
+
+  componentDidCatch(error: unknown) {
+    console.error(`${this.props.name} render error`, error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <section className="rounded-md border border-red-200 bg-red-50 px-4 py-4 text-sm text-red-700">
+          <p className="font-medium">{this.props.fallback}</p>
+          {this.state.message && <p className="mt-1">{this.state.message}</p>}
+        </section>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 function getStoredUser() {
   if (typeof window === "undefined") {
     return null;
   }
 
-  const storedUser = window.localStorage.getItem(authStorageKey);
+  let storedUser: string | null = null;
+
+  try {
+    storedUser = window.localStorage.getItem(authStorageKey);
+  } catch (error) {
+    console.error("Failed to read login state from localStorage", error);
+    return null;
+  }
 
   if (!storedUser) {
     return null;
@@ -336,9 +393,38 @@ function getStoredUser() {
   try {
     const parsedUser = JSON.parse(storedUser) as AuthorizedUser;
     return parsedUser.name && parsedUser.role ? parsedUser : null;
-  } catch {
-    window.localStorage.removeItem(authStorageKey);
+  } catch (error) {
+    console.error("Failed to parse stored login state", error);
+    try {
+      window.localStorage.removeItem(authStorageKey);
+    } catch (removeError) {
+      console.error("Failed to clear invalid login state", removeError);
+    }
     return null;
+  }
+}
+
+function saveStoredUser(user: AuthorizedUser) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(authStorageKey, JSON.stringify(user));
+  } catch (error) {
+    console.error("Failed to save login state to localStorage", error);
+  }
+}
+
+function clearStoredUser() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(authStorageKey);
+  } catch (error) {
+    console.error("Failed to clear login state from localStorage", error);
   }
 }
 
@@ -630,15 +716,15 @@ export default function Home() {
   );
   const [degreeFilter, setDegreeFilter] = useState<DegreeFilter>("全部");
   const [studentFilter, setStudentFilter] = useState("全部学生");
-  const [currentUser, setCurrentUser] = useState<AuthorizedUser | null>(
-    getStoredUser,
-  );
+  const [currentUser, setCurrentUser] = useState<AuthorizedUser | null>(null);
   const [loginName, setLoginName] = useState("");
   const [loginError, setLoginError] = useState("");
   const [editNote, setEditNote] = useState("");
   const [formError, setFormError] = useState("");
   const [dataError, setDataError] = useState("");
+  const [isAuthChecking, setIsAuthChecking] = useState(true);
   const [isDataLoading, setIsDataLoading] = useState(false);
+  const [hasLoadedData, setHasLoadedData] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGanttOpen, setIsGanttOpen] = useState(false);
 
@@ -659,13 +745,45 @@ export default function Home() {
   );
 
   useEffect(() => {
-    if (!currentUser) {
-      return;
+    let isActive = true;
+
+    async function restoreLoginState() {
+      try {
+        await Promise.resolve();
+        const storedUser = getStoredUser();
+
+        if (isActive) {
+          setCurrentUser(storedUser);
+        }
+      } catch (error) {
+        console.error("Failed to restore login state", error);
+        if (isActive) {
+          setCurrentUser(null);
+        }
+      } finally {
+        if (isActive) {
+          setIsAuthChecking(false);
+        }
+      }
     }
 
+    restoreLoginState();
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  useEffect(() => {
     let isActive = true;
 
     async function loadData() {
+      if (!currentUser) {
+        setIsDataLoading(false);
+        setHasLoadedData(false);
+        return;
+      }
+
       setIsDataLoading(true);
       setDataError("");
 
@@ -674,7 +792,16 @@ export default function Home() {
         const data = (await response.json()) as DataResponse & { error?: string };
 
         if (!response.ok) {
-          throw new Error(data.error ?? "读取数据库数据失败。");
+          console.error("Data API returned an error", data.error);
+          throw new Error("数据加载失败，请刷新页面或联系管理员。");
+        }
+
+        if (
+          !Array.isArray(data.students) ||
+          !Array.isArray(data.tasks) ||
+          !Array.isArray(data.task_logs)
+        ) {
+          throw new Error("暂无任务数据或数据加载异常。");
         }
 
         if (!isActive) {
@@ -685,9 +812,16 @@ export default function Home() {
         setTasks(sortTasksByStudents(data.tasks, data.students));
         setRecords(data.task_logs);
         setNewTask(createDefaultTaskForm(data.students));
+        setHasLoadedData(true);
       } catch (error) {
+        console.error("Failed to load system data", error);
         if (isActive) {
-          setDataError(error instanceof Error ? error.message : "读取数据库数据失败。");
+          setHasLoadedData(false);
+          setDataError(
+            error instanceof Error
+              ? error.message
+              : "数据加载失败，请刷新页面或联系管理员。",
+          );
         }
       } finally {
         if (isActive) {
@@ -711,20 +845,30 @@ export default function Home() {
     : null;
 
   const filteredStudents = useMemo(() => {
-    if (studentFilter !== "全部学生") {
-      return students.filter((student) => student.id === studentFilter);
-    }
+    try {
+      if (studentFilter !== "全部学生") {
+        return students.filter((student) => student.id === studentFilter);
+      }
 
-    if (degreeFilter !== "全部") {
-      return students.filter((student) => student.degree === degreeFilter);
-    }
+      if (degreeFilter !== "全部") {
+        return students.filter((student) => student.degree === degreeFilter);
+      }
 
-    return students;
+      return students;
+    } catch (error) {
+      console.error("Failed to filter students", error);
+      return [];
+    }
   }, [degreeFilter, studentFilter, students]);
 
   const filteredTasks = useMemo(() => {
-    const studentIds = new Set(filteredStudents.map((student) => student.id));
-    return tasks.filter((task) => studentIds.has(task.studentId));
+    try {
+      const studentIds = new Set(filteredStudents.map((student) => student.id));
+      return tasks.filter((task) => studentIds.has(task.studentId));
+    } catch (error) {
+      console.error("Failed to filter tasks", error);
+      return [];
+    }
   }, [filteredStudents, tasks]);
 
   const delayedStartTasks = useMemo(
@@ -807,55 +951,63 @@ export default function Home() {
   );
 
   const studentStageSummaries = useMemo(
-    () =>
-      filteredStudents.map((student) => {
-        const studentTasks = sortTasks(
-          filteredTasks.filter((task) => task.studentId === student.id),
-        );
-        const currentTasks = studentTasks.filter((task) => {
-          if (
-            task.status === "已完成" ||
-            task.status === "取消/归档" ||
-            task.progress === 100
-          ) {
-            return false;
-          }
+    () => {
+      try {
+        return filteredStudents.map((student) => {
+          const studentTasks = sortTasks(
+            filteredTasks.filter((task) => task.studentId === student.id),
+          );
+          const currentTasks = studentTasks.filter((task) => {
+            if (
+              task.status === "已完成" ||
+              task.status === "取消/归档" ||
+              task.progress === 100
+            ) {
+              return false;
+            }
 
-          const isInCurrentDateRange =
-            getDateTime(task.startDate) <= today.getTime() &&
-            getDateTime(task.endDate) >= today.getTime();
-          const isMarkedInProgress = task.status === "进行中";
-          const hasPartialProgress = task.progress > 0 && task.progress < 100;
+            const isInCurrentDateRange =
+              getDateTime(task.startDate) <= today.getTime() &&
+              getDateTime(task.endDate) >= today.getTime();
+            const isMarkedInProgress = task.status === "进行中";
+            const hasPartialProgress = task.progress > 0 && task.progress < 100;
 
-          return isInCurrentDateRange || isMarkedInProgress || hasPartialProgress;
+            return (
+              isInCurrentDateRange || isMarkedInProgress || hasPartialProgress
+            );
+          });
+          const sortedCurrentTasks = [...currentTasks].sort((first, second) => {
+            const riskCompare =
+              riskPriority[getComputedRiskLevel(first)] -
+              riskPriority[getComputedRiskLevel(second)];
+
+            if (riskCompare !== 0) {
+              return riskCompare;
+            }
+
+            const endDateCompare = first.endDate.localeCompare(second.endDate);
+
+            if (endDateCompare !== 0) {
+              return endDateCompare;
+            }
+
+            return first.progress - second.progress;
+          });
+          const primaryTask = sortedCurrentTasks[0] ?? null;
+
+          return {
+            student,
+            currentTasks: sortedCurrentTasks,
+            primaryTask,
+            averageProgress: getAverageProgress(studentTasks),
+            currentRisk: primaryTask ? getComputedRiskLevel(primaryTask) : "正常",
+          };
         });
-        const sortedCurrentTasks = [...currentTasks].sort((first, second) => {
-          const riskCompare =
-            riskPriority[getComputedRiskLevel(first)] -
-            riskPriority[getComputedRiskLevel(second)];
-
-          if (riskCompare !== 0) {
-            return riskCompare;
-          }
-
-          const endDateCompare = first.endDate.localeCompare(second.endDate);
-
-          if (endDateCompare !== 0) {
-            return endDateCompare;
-          }
-
-          return first.progress - second.progress;
-        });
-        const primaryTask = sortedCurrentTasks[0] ?? null;
-
-        return {
-          student,
-          currentTasks: sortedCurrentTasks,
-          primaryTask,
-          averageProgress: getAverageProgress(studentTasks),
-          currentRisk: primaryTask ? getComputedRiskLevel(primaryTask) : "正常",
-        };
-      }),
+      } catch (error) {
+        console.error("Failed to build student summaries", error);
+        return [];
+      }
+    },
     [filteredStudents, filteredTasks, sortTasks],
   );
 
@@ -906,14 +1058,28 @@ export default function Home() {
   ]);
 
   const sortedTasks = useMemo(
-    () => sortTasks(filteredTasks),
+    () => {
+      try {
+        return sortTasks(filteredTasks);
+      } catch (error) {
+        console.error("Failed to sort tasks", error);
+        return [];
+      }
+    },
     [filteredTasks, sortTasks],
   );
 
-  const groupedTasks = filteredStudents.map((student) => ({
-    student,
-    tasks: sortedTasks.filter((task) => task.studentId === student.id),
-  }));
+  const groupedTasks = useMemo(() => {
+    try {
+      return filteredStudents.map((student) => ({
+        student,
+        tasks: sortedTasks.filter((task) => task.studentId === student.id),
+      }));
+    } catch (error) {
+      console.error("Failed to group tasks", error);
+      return [];
+    }
+  }, [filteredStudents, sortedTasks]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -930,6 +1096,7 @@ export default function Home() {
     try {
       const response = await fetch("/api/auth", {
         method: "POST",
+        cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: trimmedName }),
       });
@@ -942,8 +1109,9 @@ export default function Home() {
       const user = { name: data.name, role: data.role };
       setCurrentUser(user);
       setLoginName("");
-      window.localStorage.setItem(authStorageKey, JSON.stringify(user));
+      saveStoredUser(user);
     } catch (error) {
+      console.error("Login failed", error);
       setLoginError(
         error instanceof Error
           ? error.message
@@ -953,10 +1121,12 @@ export default function Home() {
   }
 
   function logout() {
-    window.localStorage.removeItem(authStorageKey);
+    clearStoredUser();
     setCurrentUser(null);
     setLoginName("");
     setLoginError("");
+    setDataError("");
+    setHasLoadedData(false);
     setEditingTaskId(null);
     setDeletingTaskId(null);
     setIsAddingTask(false);
@@ -1065,6 +1235,7 @@ export default function Home() {
     try {
       const response = await fetch(`/api/tasks/${editingTask.id}`, {
         method: "PATCH",
+        cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...normalizedDraft,
@@ -1092,6 +1263,7 @@ export default function Home() {
       setRecords((current) => [...(data.logs ?? []), ...current]);
       closeEditor();
     } catch (error) {
+      console.error("Failed to save task", error);
       setFormError(
         error instanceof Error
           ? error.message
@@ -1145,6 +1317,7 @@ export default function Home() {
     try {
       const response = await fetch("/api/tasks", {
         method: "POST",
+        cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...normalizedNewTask,
@@ -1163,6 +1336,7 @@ export default function Home() {
       setRecords((current) => (data.log ? [data.log, ...current] : current));
       closeTaskCreator();
     } catch (error) {
+      console.error("Failed to create task", error);
       setFormError(error instanceof Error ? error.message : "新增任务失败。");
     } finally {
       setIsSubmitting(false);
@@ -1187,6 +1361,7 @@ export default function Home() {
     try {
       const response = await fetch(`/api/tasks/${deletingTask.id}`, {
         method: "DELETE",
+        cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           editorName: currentUser.name,
@@ -1206,10 +1381,21 @@ export default function Home() {
       setRecords((current) => (data.log ? [data.log, ...current] : current));
       closeDeleteDialog();
     } catch (error) {
+      console.error("Failed to delete task", error);
       setFormError(error instanceof Error ? error.message : "删除任务失败。");
     } finally {
       setIsSubmitting(false);
     }
+  }
+
+  if (isAuthChecking) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 px-4 py-8 text-slate-950">
+        <p className="rounded-md border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600 shadow-sm">
+          正在加载系统数据...
+        </p>
+      </main>
+    );
   }
 
   if (!currentUser) {
@@ -1257,8 +1443,12 @@ export default function Home() {
           </form>
         </section>
       </main>
-    );
+      );
   }
+
+  const hasDataIssue =
+    !isDataLoading &&
+    (!hasLoadedData || students.length === 0 || tasks.length === 0);
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950">
@@ -1302,10 +1492,20 @@ export default function Home() {
                 : "border-slate-200 bg-white text-slate-600"
             }`}
           >
-            {dataError || "正在从 Supabase 读取最新数据..."}
+            {dataError || "正在加载系统数据..."}
           </div>
         )}
 
+        {hasDataIssue && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            暂无任务数据或数据加载异常。
+          </div>
+        )}
+
+        <SafeSection
+          name="Dashboard"
+          fallback="首页统计模块加载失败，请刷新页面或联系管理员。"
+        >
         <section aria-labelledby="dashboard-title">
           <div className="mb-4 flex items-center justify-between">
             <h2 id="dashboard-title" className="text-xl font-semibold">
@@ -1571,6 +1771,7 @@ export default function Home() {
             })}
           </div>
         </section>
+        </SafeSection>
 
         <section
           aria-labelledby="filters-title"
@@ -1631,6 +1832,10 @@ export default function Home() {
           </div>
         </section>
 
+        <SafeSection
+          name="Gantt"
+          fallback="甘特图加载失败，其他模块仍可继续使用。"
+        >
         <section
           aria-labelledby="gantt-title"
           className="rounded-md border border-slate-200 bg-white p-4 shadow-sm sm:p-5"
@@ -1665,9 +1870,12 @@ export default function Home() {
             </div>
           </div>
 
-          <div
-            className={`${isGanttOpen ? "block" : "hidden"} overflow-x-auto md:block`}
-          >
+          {groupedTasks.length === 0 ? (
+            <p className="rounded-md bg-slate-50 px-3 py-4 text-sm text-slate-500">
+              暂无任务数据或数据加载异常。
+            </p>
+          ) : (
+          <div className={`${isGanttOpen ? "block" : "hidden"} overflow-x-auto md:block`}>
             <div className="w-full min-w-[736px] md:min-w-[760px]">
               <div className="grid grid-cols-[120px_repeat(14,44px)] border-b border-slate-100 text-[11px] font-medium text-slate-500 md:grid-cols-[170px_repeat(14,minmax(48px,1fr))]">
                 <div className="sticky left-0 z-10 bg-white py-3 pr-3">
@@ -1818,8 +2026,14 @@ export default function Home() {
               </div>
             </div>
           </div>
+          )}
         </section>
+        </SafeSection>
 
+        <SafeSection
+          name="Task table"
+          fallback="任务表加载失败，其他模块仍可继续使用。"
+        >
         <section
           aria-labelledby="task-table-title"
           className="rounded-md border border-slate-200 bg-white shadow-sm"
@@ -1836,13 +2050,23 @@ export default function Home() {
               新增任务
             </button>
           </div>
+          {sortedTasks.length === 0 ? (
+            <p className="px-4 py-5 text-sm text-slate-500">
+              暂无任务数据或数据加载异常。
+            </p>
+          ) : (
+          <>
           <div className="block divide-y divide-slate-100 md:hidden">
             {sortedTasks.map((task) => {
               const student = getStudent(task.studentId);
               const computedRisk = getComputedRiskLevel(task);
 
               return (
-                <article key={task.id} className="p-4">
+                <article
+                  key={task.id}
+                  onClick={() => openEditor(task)}
+                  className="cursor-pointer p-4"
+                >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="text-sm font-semibold text-slate-950">
@@ -1898,14 +2122,20 @@ export default function Home() {
                   <div className="mt-4 grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      onClick={() => openEditor(task)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openEditor(task);
+                      }}
                       className="inline-flex min-h-10 items-center justify-center rounded-md border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-500 hover:bg-slate-100"
                     >
                       编辑
                     </button>
                     <button
                       type="button"
-                      onClick={() => openDeleteDialog(task)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openDeleteDialog(task);
+                      }}
                       className="inline-flex min-h-10 items-center justify-center rounded-md border border-red-200 px-3 py-2 text-sm font-medium text-red-600 transition hover:border-red-300 hover:bg-red-50"
                     >
                       删除
@@ -2020,8 +2250,15 @@ export default function Home() {
               </tbody>
             </table>
           </div>
+          </>
+          )}
         </section>
+        </SafeSection>
 
+        <SafeSection
+          name="Change records"
+          fallback="最近修改记录加载失败，其他模块仍可继续使用。"
+        >
         <section
           aria-labelledby="records-title"
           className="rounded-md border border-slate-200 bg-white p-4 shadow-sm sm:p-5"
@@ -2029,6 +2266,12 @@ export default function Home() {
           <h2 id="records-title" className="text-xl font-semibold">
             最近修改记录
           </h2>
+          {records.length === 0 ? (
+            <p className="mt-4 rounded-md bg-slate-50 px-3 py-4 text-sm text-slate-500">
+              暂无修改记录或记录加载异常。
+            </p>
+          ) : (
+          <>
           <div className="mt-4 block space-y-3 md:hidden">
             {records.map((record) => (
               <article
@@ -2109,7 +2352,10 @@ export default function Home() {
               </tbody>
             </table>
           </div>
+          </>
+          )}
         </section>
+        </SafeSection>
       </div>
 
       {deletingTask && deletingStudent && (
